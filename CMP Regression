@@ -1,0 +1,541 @@
+#--------------------------------------------------------------------
+# LogSumExp Function: Recursive formula
+# https://rpubs.com/FJRubio/LSE
+#--------------------------------------------------------------------
+
+set.seed(123)  # Setting the seed for reproducibility
+
+# Function: LSE_R
+# Purpose: Compute the log-sum-exp of a vector in a numerically stable way.
+# Input: vec - A numeric vector.
+# Output: Numeric value representing the log-sum-exp of the input vector.
+# Description: This function stabilizes the numerical computation by sorting the vector 
+#              in decreasing order and iteratively applying the log1p(exp()) to prevent
+#              overflow or underflow.
+LSE_R <- function(vec){ 
+  n.vec <- length(vec)
+  vec <- sort(vec, decreasing = TRUE)
+  Lk <- vec[1]
+  for (k in 1:(n.vec-1)) {
+    Lk <- max(vec[k+1], Lk) + log1p(exp(-abs(vec[k+1] - Lk))) 
+  }
+  return(Lk)
+}
+# Function: MLECMP
+# Purpose: Perform Maximum Likelihood Estimation for CMP Regression using optimization techniques.
+# Inputs:
+#   - init: Initial point estimates for optimization.
+#   - resp: Response variable.
+#   - des_a: Design matrix for lambda predictors.
+#   - des_b: Design matrix for nu predictors.
+#   - REG: indicator of regression model or intercept only model(default TRUE).
+#   - NN: Number of iterations to approximate normalizing constant Z.
+#   - method: Optimization method to use ('nlminb' or others supported by optim).
+#   - maxit: Maximum number of iterations in the optimization step.
+# Outputs: A list containing the optimized parameter estimates, the function used for optimization,
+#          and results from the optimization function.
+
+MLECMP <- function(init, resp, des_a = NULL, des_b = NULL, type, NN, method, maxit = 100){
+  # Ensure the design matrices are not null to prevent errors
+  if(!is.null(des_a)){
+    des_a <- as.matrix(des_a)
+    p <- ncol(des_a)
+  } 
+  
+  if(!is.null(des_b)){
+    des_b <- as.matrix(des_b)
+    q <- ncol(des_b)
+  }  
+  
+  resp <- as.vector(resp)
+  n <- length(resp)
+  
+  
+  # Required values for log-likelihood
+  lfact <- lfactorial(resp)
+  lf_NN <- lfactorial(0:NN)
+  # No regression-based model
+  if(type==1){
+    # Calculate the sum of all response values
+    sumdat <- sum(resp)
+    # Calculate the sum of the logarithm of the factorials of response values
+    slfact <- sum(lfactorial(resp))
+    # Same method as above to get negative log likelihood 
+    loglik = function(par){
+      lambda <- exp(par[1])
+      nu <- exp(par[2])
+      
+      logZs <- (0:NN)*log(lambda) - nu*lfactorial(0:NN)
+      
+      # Log-normalising constant using logSumExp formula
+      LZN <- LSE_R(logZs)
+      
+      # Log likelihood
+      out <- -n*LZN + sumdat*log(lambda) -nu*slfact 
+      
+      return(-out)
+    }
+  }else if(type == 2){
+    # Constant lambda with regression for nu
+    loglik = function(params) {
+      lambda <- exp(params[1])  # lambda treated as constant, first parameter
+      beta <- params[2:(q+1)]
+      log_nu <- as.vector(des_b %*% beta)  # nu modeled as a function of predictors
+      nu <- as.vector(exp(log_nu))
+      logZs <- sapply(1:n, function(i) {
+        # Compute log normalization constants for each observation
+        LSE_R((0:NN) * log(lambda) - nu[i] * lf_NN)
+      })
+      
+      # Calculate total log-likelihood
+      out <- -sum(logZs) + sum(resp * log(lambda)) - sum(nu * lfact)
+      return(-out)
+    }
+  }else if(type == 3){
+    # Regression for lambda with constant nu
+    loglik = function(params) {
+      beta <- params[1:p]
+      nu <- exp(params[p + 1])  # nu is treated as constant and is the last parameter
+      
+      log_lambda <- des_a %*% beta
+      lambda <- exp(log_lambda)
+      
+      # Compute log normalization constants for each observation
+      logZs <- sapply(1:n, function(i) {
+        # Each element is lambda[i] raised to powers 0:NN, reduced by nu times log(factorials)
+        LSE_R((0:NN) * log_lambda[i] - nu * lf_NN)
+      })
+      
+      # Calculate total log-likelihood
+      out <- -sum(logZs) + sum(resp * log_lambda) - nu * sum(lfact)
+      return(-out)
+    }
+  }else if(type==4){
+    # Define the minus log-likelihood function for regression model
+    # Reparameterised using a log link
+    loglik = function(params){
+      # Extract Parameters
+      alpha <- params[1:p]
+      beta <- params[(p+1):(p+q)]
+      # Calculate the logarithm of lambda and exponentiate the log of lambda to avoid 
+      # result in negative values which do not make sense for a rate parameter (same for nu)
+      log_lambda <- as.vector(des_a %*% alpha)
+      lambda <- as.vector(exp(log_lambda))
+      nu <- as.vector(exp(des_b %*% beta))
+      # Initialize a matrix to store values to compute log normalizing constant Z
+      logZs <- matrix(0, nrow = n, ncol = NN+1)
+      
+      # Fill the matrix with values for each data point
+      for(i in 1:n){
+        # logZ = count * log_lambda - nu * log(factorial(count))
+        logZs[i,] <- (0:NN)*log_lambda[i] - nu[i]*lf_NN
+      }
+      
+      
+      # Log-normalising constant using logSumExp formula
+      LZN <- apply(logZs,1, LSE_R)
+      
+      # Log likelihood function
+      out <- - sum(LZN) + sum(resp*log_lambda) - sum(nu*lfact) 
+      
+      return(-out)
+    }
+  }
+  
+  
+  # Evaluate the optimization method specified in the future
+  # 'loglik' is the function to minimize
+  if(method == "nlminb") OPT <- nlminb(init, loglik, control = list(iter.max = maxit))
+  if(method != "nlminb") OPT <- optim(init, loglik, control = list(maxit = maxit), method = method)
+  
+  # Extract the parameter estimates from the optimization output
+  MLE <-  OPT$par
+  if(type == 1){
+    # Type 1: No regression, simple model
+    names(MLE) <- c("intercept_a", "intercept_b" )
+  }else if (type == 2) {
+    # Type 2: Constant lambda with regression for nu
+    names(MLE) <- c("lambda_constant", "intercept_b", paste(paste("des_b[,",2:q, sep = ""),"]", sep = ""))
+  }else if (type == 3) {
+    # Type 3: Regression for lambda with constant nu
+    names(MLE) <- c("intercept_a",paste(paste("des_a[,",2:p, sep = ""),"]", sep = ""),"nu_constant")
+  }else if(type == 4){
+    # Type 4: Full regression for both lambda and nu
+    names(MLE) <- c("intercept_a",paste(paste("des_a[,",2:p, sep = ""),"]", sep = ""), 
+                    "intercept_b",  paste(paste("des_b[,",2:q, sep = ""),"]", sep = ""))
+  }
+  outf <- list(loglik = loglik, OPT = OPT, MLE = MLE)
+  return(outf)
+  
+}
+install.packages("COMPoissonReg")
+library(COMPoissonReg)
+data("couple")
+head(couple)
+
+par(mfrow=c(1,3))
+# Histogram of Usual Partner Behavior (UPB)
+hist(couple$UPB, ylim = c(0,350), main="Histogram of Usual Partner Behavior", xlab="Usual Partner Behavior Counts", col="lightblue", border="black")
+# Bar Plot for Education Level
+barplot(table(couple$EDUCATION), ylim = c(0,250), main="Education Levels", xlab="Education", ylab="Count", col=c("lightgreen", "lightcoral"), names.arg=c("No Higher Ed", "Higher Ed"))
+# Density Plot for Anxiety Levels
+plot(density(couple$ANXIETY, na.rm=TRUE), main="Density of Anxiety Levels", xlab="Anxiety Levels", col="purple", lwd=2)
+par(mfrow=c(1,2))
+# Scatter Plot of UPB by Education Level
+# Assuming Education is a factor with levels indicating educational status
+plot(couple$UPB ~ couple$EDUCATION, col=c("blue", "red")[couple$EDUCATION+1], main="Scatter Plot of UPB by Education", xlab="Education", ylab="Usual Partner Behavior", pch=19)
+legend("topright", legend=c("No Higher Ed", "Higher Ed"), col=c("blue", "red"), pch=19)
+
+# Scatter Plot of UPB Against Anxiety
+plot(couple$ANXIETY, couple$UPB, main="UPB vs. Anxiety", xlab="Anxiety Levels", ylab="Usual Partner Behavior", pch=19, col=ifelse(couple$EDUCATION == 1, "blue", "red"))
+legend("topright", legend=c("Higher Ed", "No Higher Ed"), col=c("blue", "red"), pch=19)
+
+
+
+des_a <- cbind(1, couple$EDUCATION, couple$ANXIETY)
+colnames(des_a) <- c("intercept","EDUCATION", "ANXIETY")
+des_b <- cbind(1, couple$EDUCATION, couple$ANXIETY)
+colnames(des_b) <- c("intercept","EDUCATION", "ANXIETY")
+
+
+
+
+# Direct optimisation
+
+# 1.Fits a simple CMP model without regression covariates. 
+# Use only intercepts (constant terms) for both lambda and nu.
+# MLEREG0 <- MLECMP(init = rep(0,2), resp = couple$UPB, des_a = rep(1,nrow(couple)), des_b = rep(1,nrow(couple)), 
+#                  NN = 100, method = "nlminb", maxit = 1000, REG = FALSE)
+
+# 2.Fits a CMP model with full regression included for both lambda and nu.
+# MLEREG1 <- MLECMP(init = rep(0,6), resp = couple$UPB, des_a = des_a, des_b = des_b, 
+#                  NN = 100, method = "nlminb", maxit = 1000)
+# 3.Switches to the "Nelder-Mead" optimization method.
+# A derivative-free method that is good for nonlinear optimization problems.
+# MLEREG2 <- MLECMP(init = rep(0,6), resp = couple$UPB, des_a = des_a, des_b = des_b, 
+#                 NN = 100, method = "Nelder-Mead", maxit = 1000)
+
+# 4.Use BFGS method, a quasi-Newton method that approximates the Hessian matrix, 
+# which describes the second-order partial derivatives of a multivariable function.
+# This method produces the best results
+# BFGS
+MLEREGBF1 <- MLECMP(init = rep(0.01,2), resp = couple$UPB, des_a = NULL, des_b = NULL, 
+                    NN = 100, method = "BFGS", maxit = 1000,type=1)
+AIC=-2*(-781.1994)+2*2 # 1566.399
+MLEREGBF2 <- MLECMP(init = rep(0.01,4), resp = couple$UPB, des_a = NULL, des_b = des_b, 
+                    NN = 100, method = "BFGS", maxit = 1000,type=2)
+AIC=-2*(-762.7718)+2*4 # 1533.544
+MLEREGBF3 <- MLECMP(init = rep(0.01,4), resp = couple$UPB, des_a = des_a, des_b = NULL, 
+                    NN = 100, method = "BFGS", maxit = 1000,type=3)
+AIC=-2*(-756.993)+2*4 # 1521.986
+MLEREGBF4 <- MLECMP(init = rep(0.01,6), resp = couple$UPB, des_a = des_a, des_b = des_b, 
+                    NN = 100, method = "BFGS", maxit = 1000,type=4)
+AIC=-2*(-756.0087)+2*6 # 1524.017
+# nlminb
+MLEREGnlm1 <- MLECMP(init = rep(0.01,2), resp = couple$UPB, des_a = NULL, des_b = NULL, 
+                     NN = 100, method = "nlminb", maxit = 1000,type=1)
+AIC=-2*(-781.1774)+2*2 # 1566.355
+MLEREGnlm2 <- MLECMP(init = rep(0.01,4), resp = couple$UPB, des_a = NULL, des_b = des_b, 
+                     NN = 100, method = "nlminb", maxit = 1000,type=2)
+AIC=-2*(-762.754)+2*4 # 1533.508
+MLEREGnlm3 <- MLECMP(init = rep(0.01,4), resp = couple$UPB, des_a = des_a, des_b = NULL, 
+                     NN = 100, method = "nlminb", maxit = 1000,type=3)
+AIC=-2*(-756.9918)+2*4 # 1521.984
+MLEREGnlm4 <- MLECMP(init = rep(0.01,6), resp = couple$UPB, des_a = des_a, des_b = des_b, 
+                     NN = 100, method = "nlminb", maxit = 1000,type=4)
+AIC=-2*(-756.0087)+2*6 # 1524.017
+# Nelder-Mead
+MLEREGNelder1 <- MLECMP(init = rep(0.01,2), resp = couple$UPB, des_a = NULL, des_b = NULL, 
+                        NN = 100, method = "Nelder-Mead", maxit = 1000,type=1)
+AIC=-2*(-781.1774)+2*2 # 1566.355
+MLEREGNelder2 <- MLECMP(init = rep(0.01,4), resp = couple$UPB, des_a = NULL, des_b = des_b, 
+                        NN = 100, method = "Nelder-Mead", maxit = 1000,type=2)
+AIC=-2*(-781.1774)+2*4 # 1570.355
+MLEREGNelder3 <- MLECMP(init = rep(0.1,4), resp = couple$UPB, des_a = des_a, des_b = NULL, 
+                        NN = 100, method = "Nelder-Mead", maxit = 1000,type=3)
+AIC=-2*(-756.9918)+2*4 # 1521.98
+MLEREGNelder4 <- MLECMP(init = rep(0.01,6), resp = couple$UPB, des_a = des_a, des_b = des_b, 
+                        NN = 100, method = "Nelder-Mead", maxit = 1000,type=4)
+AIC=-2*(-756.7452)+2*6 # 1525.49
+# which.min(c(MLEREG4$OPT$value,MLEREG41$OPT$objective,MLEREG42$OPT$value))
+
+# Using R package
+mle.cmp1 <- glm.cmp(formula.lambda = UPB~1, 
+                   formula.nu = UPB~1, 
+                   data = couple)
+# -781.1772
+# Using R package
+mle.cmp3 <- glm.cmp(formula.lambda = UPB~EDUCATION+ANXIETY, 
+                   formula.nu = UPB~1, 
+                   data = couple)
+# -756.9917
+
+# mle.cmp2 <- glm.cmp(formula.lambda = UPB ~ 1, 
+#                     formula.nu = UPB ~ EDUCATION + ANXIETY, 
+#                     data = couple)
+
+mle.cmp4 <- glm.cmp(formula.lambda = UPB~EDUCATION+ANXIETY, 
+                   formula.nu = UPB~EDUCATION+ANXIETY, 
+                   data = couple)
+# -756.0091
+# summary(mle.cmp1)
+
+cbind(coef(mle.cmp4),
+      MLEREGBF4$OPT$par)
+
+cbind(coef(mle.cmp3),
+      MLEREGBF3$OPT$par)
+
+
+c(logLik(mle.cmp4), -MLEREGBF4$OPT$value)
+c(logLik(mle.cmp1), -MLEREGBF1$OPT$value)
+c(logLik(mle.cmp3), -MLEREGBF3$OPT$value)
+
+# Profile likelihood of the full model
+# The full model using BFGS method with initia value 0.1
+MLEREGBF4 <- MLECMP(init = rep(0.01,6), resp = couple$UPB, des_a = des_a, des_b = des_b, 
+                    NN = 100, method = "BFGS", maxit = 1000,type=4)
+# The length of total parameters
+p <- length(MLEREGBF4$OPT$par)
+ML <- -MLEREGBF4$OPT$value # Maximum likelihood
+
+prof.lik <- function(par1, ind){
+  tempf <- function(par){
+    tempv <- MLEREGBF4$OPT$par  # Start with the optimized parameters
+    tempv[ind] <- par1          # Set the fixed parameter
+    tempv[-ind] <- par          # Update other parameters
+    
+    out0 <- -MLEREGBF4$loglik(tempv) # Return the log likelihood
+    return(-out0) # Negate this value for optimization(minimise the negative log likelihood)
+  }
+  
+  out <- -optim(MLEREGBF4$OPT$par[-ind],tempf, control = list(maxit = 10000), method = "BFGS")$value - ML
+  
+  return(exp(out))
+}
+critical_value <- qchisq(0.95, df = 1) # Calculate the critical value with degree of freedom 6
+par(mfrow=c(1,1))
+prof1 <- Vectorize(function(par) prof.lik(par, 1))
+curve(prof1,-0.5,-0.2, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 1")
+
+param_range1 <- seq(-0.5, -0.2, length.out = 200) # Set the range of parameter
+likelihood_ratios1 <- prof1(param_range1) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval1 <- which(-2 * log(likelihood_ratios1) <= critical_value) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval1) > 0) {
+  conf_interval1 <- range(param_range1[within_confidence_interval1])
+} else {
+  conf_interval1 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval1, col = "blue", lty = 2)  # Vertical lines for confidence interval
+# running_time 1939.709s
+recordedPlot1 <- recordPlot()
+
+prof2 <- Vectorize(function(par) prof.lik(par, 2))
+curve(prof2, -0.3,0.2, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 2" )
+param_range2 <- seq(-0.3, 0.2, length.out = 200) # Set the range of parameter
+likelihood_ratios2 <- prof2(param_range2) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval2 <- which(-2 * log(likelihood_ratios2) <= critical_value) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval2) > 0) {
+  conf_interval2 <- range(param_range2[within_confidence_interval2])
+} else {
+  conf_interval2 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval2, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot2 <- recordPlot()
+
+prof3 <- Vectorize(function(par) prof.lik(par, 3))
+curve(prof3,-0,0.3, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 3")
+
+param_range3 <- seq(0, 0.3, length.out = 200) # Set the range of parameter
+likelihood_ratios3 <- prof3(param_range3) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval3 <- which(-2 * log(likelihood_ratios3) <= critical_value) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval3) > 0) {
+  conf_interval3 <- range(param_range3[within_confidence_interval3])
+} else {
+  conf_interval3 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval3, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot3 <- recordPlot()
+
+prof4 <- Vectorize(function(par) prof.lik(par, 4))
+curve(prof4, -15, -2, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 4")
+
+param_range4 <- seq(-15, -2, length.out = 200) # Set the range of parameter
+likelihood_ratios4 <- prof4(param_range4) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval4 <- which(-2 * log(likelihood_ratios4) <= critical_value) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval4) > 0) {
+  conf_interval4 <- range(param_range4[within_confidence_interval4])
+} else {
+  conf_interval4 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval4, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot4 <- recordPlot()
+
+prof5 <- Vectorize(function(par) prof.lik(par, 5))
+curve(prof5, -10, 5, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 5")
+
+param_range5 <- seq(-10, 5, length.out = 200) # Set the range of parameter
+likelihood_ratios5 <- prof5(param_range5) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval5 <- which(-2 * log(likelihood_ratios5) <= critical_value) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval5) > 0) {
+  conf_interval5 <- range(param_range5[within_confidence_interval5])
+} else {
+  conf_interval5 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval5, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot5 <- recordPlot()
+
+prof6 <- Vectorize(function(par) prof.lik(par, 6))
+curve(prof6, 0,6,n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 6" )
+
+param_range6 <- seq(0, 6, length.out = 200) # Set the range of parameter
+likelihood_ratios6 <- prof6(param_range6) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval6 <- which(-2 * log(likelihood_ratios6) <= critical_value) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval6) > 0) {
+  conf_interval6 <- range(param_range6[within_confidence_interval6])
+} else {
+  conf_interval6 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval6, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot6 <- recordPlot()
+
+running_time <- system.time({
+  
+  prof1 <- Vectorize(function(par) prof.lik(par, 1))
+  curve(prof1,-0.5,-0.2, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 1")
+  
+  param_range1 <- seq(-0.5, -0.2, length.out = 200) # Set the range of parameter
+  likelihood_ratios1 <- prof1(param_range1) # Extract the likelihood ratios
+  # Wilk's Theorem
+  within_confidence_interval1 <- which(-2 * log(likelihood_ratios1) <= critical_value) 
+  # Extract the parameter values that fall within this interval
+  if(length(within_confidence_interval1) > 0) {
+    conf_interval1 <- range(param_range1[within_confidence_interval1])
+  } else {
+    conf_interval1 <- c(NA, NA)  # In case no values are within the threshold
+  }
+  # Plot the confidence interval
+  abline(h = exp(-0.5 * critical_value), col = "red", lty = 2)  # Horizontal line for critical value
+  abline(v = conf_interval1, col = "blue", lty = 2)  # Vertical lines for confidence interval
+})
+
+# Profile likelihood of the model with only the first three parameters
+MLEREGBF3 <- MLECMP(init = rep(0.1,4), resp = couple$UPB, des_a = des_a, des_b = NULL, 
+                    NN = 100, method = "BFGS", maxit = 1000,type=3)
+# The length of total parameters
+p_best <- length(MLEREGBF3$OPT$par)
+ML_best <- -MLEREGBF3$OPT$value # Maximum likelihood
+
+
+prof.lik_best <- function(par1, ind){
+  tempf <- function(par){
+    tempv <- MLEREGBF3$OPT$par  # Start with the optimized parameters
+    tempv[ind] <- par1          # Set the fixed parameter
+    tempv[-ind] <- par          # Update other parameters
+    
+    out0 <- -MLEREGBF3$loglik(tempv) # Return the log likelihood
+    return(-out0) # Negate this value for optimization(minimise the negative log likelihood)
+  }
+  
+  out <- -optim(MLEREGBF3$OPT$par[-ind],tempf, control = list(maxit = 10000), method = "BFGS")$value - ML_best
+  
+  return(exp(out))
+}
+critical_value_best <- qchisq(0.95, df = 1) # Calculate the critical value with degree of freedom 4
+
+
+prof_1 <- Vectorize(function(par) prof.lik_best(par, 1))
+curve(prof_1,-0.60,-0.20, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 1 (The best model)")
+
+param_range_1 <- seq(-0.60, -0.20, length.out = 200) # Set the range of parameter
+likelihood_ratios_1 <- prof_1(param_range_1) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval_1 <- which(-2 * log(likelihood_ratios_1) <= critical_value_best) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval_1) > 0) {
+  conf_interval_1 <- range(param_range_1[within_confidence_interval_1])
+} else {
+  conf_interval_1 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value_best), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval_1, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot_1 <- recordPlot()
+
+prof_2 <- Vectorize(function(par) prof.lik_best(par, 2))
+curve(prof_2, -0.20, 0.07, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 2 (The best model)")
+
+param_range_2 <- seq(-0.20, 0.07, length.out = 200) # Set the range of parameter
+likelihood_ratios_2 <- prof_2(param_range_2) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval_2 <- which(-2 * log(likelihood_ratios_2) <= critical_value_best) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval_2) > 0) {
+  conf_interval_2 <- range(param_range_2[within_confidence_interval_2])
+} else {
+  conf_interval_2 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value_best), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval_2, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot_2 <- recordPlot()
+
+prof_3 <- Vectorize(function(par) prof.lik_best(par, 3))
+curve(prof_3, 0, 0.2, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 3 (The best model)")
+
+param_range_3 <- seq(0, 0.2, length.out = 200) # Set the range of parameter
+likelihood_ratios_3 <- prof_3(param_range_3) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval_3 <- which(-2 * log(likelihood_ratios_3) <= critical_value_best) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval_3) > 0) {
+  conf_interval_3 <- range(param_range_3[within_confidence_interval_3])
+} else {
+  conf_interval_3 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value_best), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval_3, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot_3 <- recordPlot()
+
+prof_4 <- Vectorize(function(par) prof.lik_best(par, 4))
+curve(prof_4, -30, 0, n=200, xlab = "Parameter value", ylab = "Profile Likelihood ratio",main = "Profile likelihood of Parameter at Index 4 (The best model)")
+
+param_range_4 <- seq(-30, 0, length.out = 200) # Set the range of parameter
+likelihood_ratios_4 <- prof_4(param_range_4) # Extract the likelihood ratios
+# Wilk's Theorem
+within_confidence_interval_4 <- which(-2 * log(likelihood_ratios_4) <= critical_value_best) 
+# Extract the parameter values that fall within this interval
+if(length(within_confidence_interval_4) > 0) {
+  conf_interval_4 <- range(param_range_4[within_confidence_interval_4])
+} else {
+  conf_interval_4 <- c(NA, NA)  # In case no values are within the threshold
+}
+# Plot the confidence interval
+abline(h = exp(-0.5 * critical_value_best), col = "red", lty = 2)  # Horizontal line for critical value
+abline(v = conf_interval_4, col = "blue", lty = 2)  # Vertical lines for confidence interval
+recordedPlot_4 <- recordPlot()
